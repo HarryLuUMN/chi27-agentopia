@@ -1,0 +1,12 @@
+.report-window-content mark {
+  background: transparent !important;
+  color: inherit;
+}
+
+.report-window-content mark.verification-mark {
+  all: unset;
+  background: #fff59d !important;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+}
