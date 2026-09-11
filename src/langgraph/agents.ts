@@ -1,0 +1,514 @@
+import { Annotation } from '@langchain/langgraph/web';
+import { ChatOpenAI } from '@langchain/openai';
+import { marked } from 'marked';
+import OpenAI from 'openai';
+
+import { getDatasetConfig } from '../game/config';
+import {
+    PRODUCTION_COPY_EDITOR_ROLE,
+    PRODUCTION_WORKING_PREMISE,
+} from '../game/config/productionAgentPolicy.ts';
+import { sequential } from '../game/assets/sprites';
+import { EventBus } from '../game/EventBus';
+import { autoControlAgent, transmitReport } from '../game/utils/controlUtils';
+import { recorder } from '../game/utils/recorder';
+import { updateStateIcons } from '../game/utils/sceneUtils';
+import { getStoredOpenAIKey } from '../utils/openai';
+import { resolveReportDepartment } from '../utils/finalReport';
+import {
+    getAgentMASPrompt,
+    getHallucinationInstruction,
+    getHallucinationStats,
+    getMASModels,
+} from './config';
+import { createMASTraceCallback } from './masTrace';
+import { getOpenAIRequestFetch } from './openaiRequestGate';
+import { createOutputVerification } from './outputVerifier';
+import { verifyManagerArtifact } from './managerVerification';
+import { SequentialGraphStateAnnotation } from './states';
+import { generateChartImage } from './visualizationGenerate';
+import {
+    returnDatasetDescription,
+    startDataFetcher,
+    startTextMessager,
+} from './workflowUtils';
+
+function hallucinationByType(t: string | undefined, scene: any) {
+    return getHallucinationInstruction(t, scene);
+}
+
+function pickStatsBy(dataset: 'baseball' | 'kidney', hType?: string) {
+    return getHallucinationStats(dataset, hType);
+}
+
+export const kidneyPath: string =
+    getDatasetConfig('kidney')?.csvPath ?? './data/kidney.csv';
+export const baseballPath: string =
+    getDatasetConfig('baseball')?.csvPath ?? './data/baseball_cleaned.csv';
+
+let cachedOpenAI: OpenAI | null = null;
+
+export function getOpenAI(): OpenAI {
+    if (!cachedOpenAI) {
+        const apiKey = getStoredOpenAIKey();
+        if (!apiKey) throw new Error('❌ OpenAI API key not set.');
+        cachedOpenAI = new OpenAI({
+            apiKey,
+            dangerouslyAllowBrowser: true,
+            maxRetries: 0,
+            fetch: getOpenAIRequestFetch(),
+        });
+    }
+    return cachedOpenAI;
+}
+
+// export const openai = new OpenAI({
+//     apiKey: import.meta.env.VITE_OPENAI_API_KEY,
+//     dangerouslyAllowBrowser: true, // This will allow the API key to be used directly in the browser environment
+// });
+
+export const promptTable = {
+    extraction:
+        'Extract the key information from the input and format it clearly and concisely.',
+    summary:
+        'Using the structured information provided, write a short news article of 3-5 sentences, ensuring clarity and brevity.',
+    analysis:
+        'Analyze the information provided and write a detailed news article of 5-7 sentences, ensuring clarity and coherence.',
+    validation:
+        'Validate the information provided and write a comprehensive news article of 7-10 sentences, ensuring clarity and coherence.',
+    voting: 'Vote for the best options based on the information provided.',
+};
+
+let cachedLLM: ChatOpenAI | null = null;
+
+export function getLLM() {
+    if (!cachedLLM) {
+        const apiKey = getStoredOpenAIKey();
+        if (!apiKey) {
+            throw new Error('OpenAI API Key is not set.');
+        }
+
+        const model = getMASModels().chat;
+        cachedLLM = new ChatOpenAI({
+            apiKey,
+            modelName: model,
+            maxRetries: 0,
+            modelKwargs: { reasoning_effort: 'minimal' },
+            configuration: { fetch: getOpenAIRequestFetch() },
+            callbacks: [createMASTraceCallback(model)],
+        });
+    }
+    return cachedLLM;
+}
+
+// export async function createReport(
+//     scene: any,
+//     zoneName: string,
+//     x: number,
+//     y: number,
+// ) {
+
+//     const reportBtn = scene.add.image(x, y, "report")
+//         .setDepth(1002).setInteractive();
+
+//     reportBtn.on("pointerdown", () => {
+//         EventBus.emit("open-report", { department: zoneName });
+//     console.log("report button clicked", zoneName);
+//         });
+
+//     return reportBtn;
+
+// }
+
+export async function createReport(
+    scene: any,
+    zoneName: string,
+    index: number,
+    x: number,
+    y: number,
+    opts?: { isFinal?: boolean; textureKey?: string },
+) {
+    const workflowLength =
+        scene.registry.get('workflowConfig')?.length ?? index + 1;
+    const department = resolveReportDepartment(zoneName, index, {
+        isFinal: opts?.isFinal,
+        finalReportIndex: workflowLength,
+    });
+    const reportBtn = scene.add
+        .image(x, y, 'report')
+        .setDepth(1002)
+        .setInteractive();
+
+    if (opts?.isFinal) {
+        reportBtn.setTexture('final_report').setScale(0.2);
+    }
+
+    reportBtn.on('pointerdown', () => {
+        EventBus.emit('open-report', { department });
+        console.log('report button clicked', department);
+        recorder.recordEvent(`report_clicked_${department}`);
+    });
+
+    if (!scene.reportIcons) scene.reportIcons = [];
+    scene.reportIcons.push(reportBtn);
+
+    return reportBtn;
+}
+
+export function resetReportIcons(scene: any) {
+    if (!scene || !scene.reportIcons) return;
+    scene.reportIcons.forEach((icon: Phaser.GameObjects.Image) => {
+        if (icon && icon.destroy) icon.destroy();
+    });
+    scene.reportIcons = [];
+}
+
+export function createJournalist(
+    agent: any,
+    destination: any,
+    scene: any,
+    tilemap: any,
+    index: number,
+    level: string,
+) {
+    const verification = createOutputVerification(scene, index);
+    return async function journalist(
+        state: typeof SequentialGraphStateAnnotation.State,
+    ) {
+        console.log('journalist state:', state.sequentialInput);
+
+        // const message = await startDataFetcher(scene, state, agent);
+
+        // const msg = await getLLM().invoke(message);
+
+        // insert hullumination based on levels
+
+        const hType = agent.getBiasType();
+        const hallucination =
+            agent.getBias() === ''
+                ? PRODUCTION_WORKING_PREMISE
+                : hallucinationByType(hType, scene);
+
+        let msg: any = '';
+        if (index === 0) {
+            const datasetDescription = returnDatasetDescription(scene, agent);
+            const roleContent = `You are a newspaper editorial, you need to return a title based on the dataset description.\n${getAgentMASPrompt(scene, agent.getBias() !== '', hType)}`;
+            const userContent = `write a news title for the given topic: ${datasetDescription}; 
+                                You should follow these statements in highest priority: ${hallucination};
+                                The title is prepared for a news or magazine article about the dataset.`;
+            msg = await startTextMessager(roleContent, userContent);
+        } else if (index === 1) {
+            msg = await startDataFetcher(
+                scene,
+                agent,
+                hType,
+                state.sequentialInput,
+            );
+        } else if (index === 2) {
+            // generating visualization code
+            msg = await generateChartImage(scene, agent);
+        }
+
+        console.log('graph:1st agent msg:', msg.content);
+        const visibleOutput = await verifyManagerArtifact(scene, agent, index, String(msg.content ?? msg.d3Code ?? ''), state.sequentialInput);
+        msg = index === 2 ? { ...msg, content: visibleOutput, d3Code: visibleOutput } : { ...msg, content: visibleOutput };
+        const verificationId = verification.agent(agent, visibleOutput);
+        const originalAgent1X = agent.x;
+        const originalAgent1Y = agent.y;
+
+        // await updateStateIcons(zones, "mail", 0);
+        //await agent.playDialogue(scene, msg.content);
+        await agent.setAgentInformation(visibleOutput, verificationId);
+        await agent.addMssgSprite(scene, 'agent_mssg');
+        console.log('debug agent pos', destination.x, destination.y);
+        await autoControlAgent(
+            scene,
+            agent,
+            tilemap,
+            destination.x as number,
+            destination.y as number,
+            'Send Message',
+        );
+        await autoControlAgent(
+            scene,
+            agent,
+            tilemap,
+            originalAgent1X,
+            originalAgent1Y,
+            'Return to Office',
+        );
+
+        // await updateStateIcons(zones, "idle", 0);
+
+        if (index === 2) {
+            return { sequentialFirstAgentOutput: msg };
+        }
+
+        return { sequentialFirstAgentOutput: msg.content };
+    };
+}
+
+export function createManager(
+    agent: any,
+    scene: any,
+    destination: any,
+    nextRoomDestination: any,
+    index: number,
+    level: string,
+) {
+    const verification = createOutputVerification(scene, index);
+    return async function Manager(
+        state: typeof SequentialGraphStateAnnotation.State,
+    ) {
+        console.log('journalist state:', state.sequentialInput);
+
+        agent.setAgentState('work');
+
+        // let stats = biasedBaseballDatasetStatistic
+        // if(scene.registry.get("currentDataset") === "kidney"){
+        //     stats = biasedKidneyDatasetStatistic;
+        // }
+
+        const hType = agent.getBiasType();
+        const currentDataset = scene.registry.get('currentDataset'); // 'baseball' | 'kidney'
+        const stats = pickStatsBy(currentDataset, hType);
+
+        const hallucination =
+            agent.getBias() === ''
+                ? PRODUCTION_WORKING_PREMISE
+                : hallucinationByType(hType, scene);
+
+        let msg: any = '';
+        if (index === 0) {
+            const datasetDescription = returnDatasetDescription(scene, agent);
+            const roleContent = `You are a newspaper editorial, you need to return a title based on the dataset description.\n${getAgentMASPrompt(scene, agent.getBias() !== '', hType)}`;
+            const userContent = `write a news title for the given topic: 
+                                ${datasetDescription}; 
+                                You should following these statements in highest priority: ${hallucination};
+                                The title is prepared for a news or magazine article about the dataset.`;
+            msg = await startTextMessager(roleContent, userContent);
+        } else if (index === 1) {
+            if (agent.getBias() === '') {
+                const roleContent = `${PRODUCTION_COPY_EDITOR_ROLE}\n${getAgentMASPrompt(scene, false, hType)}`;
+                const userContent =
+                    'Polish the paragraph while preserving its central claim. Only return the article. \n' +
+                    state.sequentialSecondAgentOutput;
+                msg = await startTextMessager(roleContent, userContent);
+            } else {
+                const roleContent = `${PRODUCTION_COPY_EDITOR_ROLE}\n${getAgentMASPrompt(scene, true, hType)}`;
+                const userContent =
+                    'Polish the paragraph while preserving its central claim. Only return the article. \n' +
+                    state.sequentialSecondAgentOutput +
+                    '\n' +
+                    `Supporting newsroom statistics: ${stats}`;
+                msg = await startTextMessager(roleContent, userContent);
+            }
+        } else if (index === 2) {
+            // generating visualization code
+            const code = state.sequentialSecondAgentOutput ?? state.sequentialFirstAgentOutput.d3Code;
+            const roleContent = `
+                    You are a Vega-Lite visualization expert.
+
+                    Your task is to verify and improve a given Vega-Lite specification.
+
+                    Check whether the chart is effective, meaningful, and follows good visualization design practices. 
+                    Fix issues such as:
+                    - Wrong or suboptimal mark types
+                    - Misused encodings (e.g., using nominal for quantitative fields)
+                    - Missing or unclear axis titles or labels
+                    - Redundant or invalid transformations
+                    - Lack of a title or legend when necessary
+
+                    Do not explain your edits. Only return the improved Vega-Lite specification as valid JSON.
+
+                    Never wrap the output in markdown or code fences. Do not include any commentary or justification.`;
+            const userContent = `
+            Please verify and improve the following Vega-Lite specification:
+
+            ${code} 
+            `;
+
+            msg = await startTextMessager(roleContent, userContent);
+
+        }
+
+        // const msg = await getLLM().invoke(message);
+
+        console.log('graph:3rd agent msg:', msg.content);
+        msg = { ...msg, content: await verifyManagerArtifact(scene, agent, index, String(msg.content ?? ''), String(state.sequentialSecondAgentOutput ?? '')) };
+        const verificationId = verification.agent(agent, String(msg.content ?? ''));
+        // await updateStateIcons(zones, "idle", 0);
+        await agent.setAgentState('idle');
+        //await agent.playDialogue(scene, msg.content);
+        await agent.setAgentInformation(msg.content, verificationId);
+        await agent.addMssgSprite(scene, 'agent_mssg');
+
+        // await createReport(scene, "chaining", index, destination.x, destination.y);
+        // const report = await createReport(scene, "chaining", index, destination.x, destination.y);
+        // await console.log("report in agent", report);
+        // await autoControlAgent(scene, report, tilemap, 530, 265, "Send Report to Next Department");
+        // await transmitReport(scene, report, nextRoomDestination.x, nextRoomDestination.y);
+        const finalRoom =
+            index === (scene.registry.get('workflowConfig')?.length ?? 1) - 1;
+
+        const report = await createReport(
+            scene,
+            'chaining',
+            index,
+            destination.x,
+            destination.y,
+            { isFinal: finalRoom },
+        );
+
+        await transmitReport(
+            scene,
+            report,
+            nextRoomDestination.x,
+            nextRoomDestination.y,
+        );
+
+        return { sequentialOutput: msg.content };
+    };
+}
+
+export function createWriter(
+    agent: any,
+    scene: any,
+    tilemap: any,
+    destination: any,
+    index: number,
+    level: string,
+) {
+    const verification = createOutputVerification(scene, index);
+    return async function writer(
+        state: typeof SequentialGraphStateAnnotation.State,
+    ) {
+        console.log('writer state: ', state.sequentialFirstAgentOutput);
+
+        agent.setAgentState('work');
+
+        const hType = agent.getBiasType();
+        let hallucination = '';
+        if (agent.getBias() !== '') {
+            const ds = scene.registry.get('currentDataset');
+            hallucination = pickStatsBy(ds, hType);
+        }
+
+        let titleBias = PRODUCTION_WORKING_PREMISE;
+        if (agent.getBias() !== '') {
+            titleBias = hallucinationByType(hType, scene);
+        }
+
+        let msg: any = '';
+        if (index === 0) {
+            const datasetDescription = returnDatasetDescription(scene, agent);
+            const roleContent = `You are a newspaper editorial, you need to return a title based on the dataset description.\n${getAgentMASPrompt(scene, agent.getBias() !== '', hType)}`;
+            const userContent = `
+            write a news title for the given topic: ${datasetDescription}; 
+            The title is prepared for a news or magazine article about the dataset.
+            You should follow these statements in highest priority: ${titleBias};`;
+            msg = await startTextMessager(roleContent, userContent);
+        } else if (index === 1) {
+            let userContent =
+                'based on the given insights, generate a consice news article to summarize that(words<200)\n' +
+                `
+                        you should follow the following format:
+                        # Title: write a compelling title for the news article
+                        ## Intro:write an engaging short intro for the news article
+                        ## Section 1: xxxx(you can use a customized sub-title for a description)
+                        Then, write a detailed description/story of the first section.
+                    ` +
+                state.sequentialFirstAgentOutput;
+            const roleContent = `You are a report writer.\n${getAgentMASPrompt(scene, agent.getBias() !== '', hType)}`;
+            if (agent.getBias() !== '') {
+                userContent += `\nHere are some statistics about the dataset, based on these statistics not the given insights to write the paragrpah, if there're some statement in insights that not follow these statistical facts, use these statistical facts: ${hallucination}`;
+            }
+            msg = await startTextMessager(roleContent, userContent);
+        } else if (index === 2) {
+            // generating visualization code
+            const code = state.sequentialFirstAgentOutput.d3Code;
+            const roleContent = `
+                    You are a Vega-Lite visualization expert.
+
+                    Your task is to verify and improve a given Vega-Lite specification.
+
+                    Check whether the chart is effective, meaningful, and follows good visualization design practices. 
+                    Fix issues such as:
+                    - Wrong or suboptimal mark types
+                    - Misused encodings (e.g., using nominal for quantitative fields)
+                    - Missing or unclear axis titles or labels
+                    - Redundant or invalid transformations
+                    - Lack of a title or legend when necessary
+
+                    Do not explain your edits. Only return the improved Vega-Lite specification as valid JSON.
+
+                    Never wrap the output in markdown or code fences. Do not include any commentary or justification.`;
+            const userContent = `
+            Please verify and improve the following Vega-Lite specification:
+
+            ${code} 
+            `;
+
+            msg = await startTextMessager(roleContent, userContent);
+        }
+
+        msg = { ...msg, content: await verifyManagerArtifact(scene, agent, index, String(msg.content ?? ''), typeof state.sequentialFirstAgentOutput === 'string' ? state.sequentialFirstAgentOutput : JSON.stringify(state.sequentialFirstAgentOutput)) };
+        const rawText = msg.content as string;
+        const verificationId = verification.agent(agent, rawText);
+        const htmlContent = marked.parse(rawText);
+
+        console.log('graph:2nd agent msg: ', msg.content);
+
+        const reportMessage = `
+        <div class="report-body">
+            ${htmlContent}
+        </div>
+        `;
+
+        // const reportMessage = `
+        // \n\n${msg.content}
+        // `;
+
+        EventBus.emit('final-report', {
+            report: reportMessage,
+            verificationId,
+            format: 'html',
+            department: 'chaining' + '-' + index,
+            title: 'Intermediate Report',
+        });
+        // send the final report to final location
+        const originalAgent2X = agent.x;
+        const originalAgent2Y = agent.y;
+
+        // await updateStateIcons(zones, "mail", 1);
+        // await updateStateIcons(scene.chainingZones, "mail");
+        //await agent.playDialogue(scene, msg.content);
+        await agent.setAgentInformation(msg.content, verificationId);
+        await agent.addMssgSprite(scene, 'agent_mssg');
+
+        await autoControlAgent(
+            scene,
+            agent,
+            tilemap,
+            destination.x,
+            destination.y,
+            'Send Report to Final Location',
+        );
+
+        await autoControlAgent(
+            scene,
+            agent,
+            tilemap,
+            originalAgent2X,
+            originalAgent2Y,
+            '',
+        );
+
+        // agent return to original location
+
+        // await updateStateIcons(scene.chainingZones, "idle");
+        // await updateStateIcons(zones, "idle", 1);
+
+        return { sequentialSecondAgentOutput: msg.content };
+    };
+}
